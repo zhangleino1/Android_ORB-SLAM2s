@@ -26,6 +26,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+
+import org.json.JSONObject;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
@@ -38,6 +40,7 @@ public class WebServer {
     private volatile boolean isRunning;
     private com.orb.slam2s.slamar.NativeHelper nativeHelper;
     private android.content.Context context;
+    private final com.orb.slam2s.navigation.NavigationService navigationService;
 
     // 存储最新数据
     private volatile byte[] lastFrame;
@@ -57,6 +60,7 @@ public class WebServer {
         this.port = port;
         this.nativeHelper = nativeHelper;
         this.context = context;
+        this.navigationService = new com.orb.slam2s.navigation.NavigationService(context, nativeHelper);
     }
 
     public void setOnFrameReceivedListener(OnFrameReceivedListener listener) {
@@ -229,7 +233,9 @@ public class WebServer {
                 String method = parts[0];
                 String path = parts[1];
 
-                if (path.equals("/upload_frame") && method.equals("POST")) {
+                if (path.startsWith("/nav")) {
+                    handleNavigationRequest(method, path, is, os);
+                } else if (path.equals("/upload_frame") && method.equals("POST")) {
                     // upload_frame 会自己读取头部
                     handleUploadFrame(is, os);
                 } else {
@@ -431,11 +437,235 @@ public class WebServer {
             }
         }
 
+
+        private void handleNavigationRequest(String method, String rawPath, InputStream is, OutputStream os) throws IOException {
+            try {
+                String path = rawPath;
+                String query = "";
+                int qIdx = rawPath.indexOf('?');
+                if (qIdx >= 0) {
+                    path = rawPath.substring(0, qIdx);
+                    query = rawPath.substring(qIdx + 1);
+                }
+
+                if ("GET".equals(method) && "/nav/graph".equals(path)) {
+                    sendJson(os, navigationService.toJson().toString());
+                    return;
+                }
+
+                if ("POST".equals(method) && "/nav/clear".equals(path)) {
+                    consumeHeaders(is);
+                    navigationService.clear();
+                    sendJson(os, "{\"ok\":true}");
+                    return;
+                }
+
+                String body = readRequestBodyAsString(is);
+                JSONObject req = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+
+                if ("POST".equals(method) && "/nav/node".equals(path)) {
+                    com.orb.slam2s.navigation.NavigationService.Node n = navigationService.addNodeAtCurrentPose(
+                            req.optString("id", null), req.optString("name", null), req.optString("type", "waypoint"));
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("id", n.id);
+                    out.put("x", n.x);
+                    out.put("y", n.y);
+                    out.put("z", n.z);
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                if ("POST".equals(method) && "/nav/edge".equals(path)) {
+                    com.orb.slam2s.navigation.NavigationService.Edge e = navigationService.addEdge(
+                            req.getString("from"),
+                            req.getString("to"),
+                            req.has("cost") ? (float) req.getDouble("cost") : null,
+                            req.optBoolean("bidirectional", true));
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("from", e.from);
+                    out.put("to", e.to);
+                    out.put("cost", e.cost);
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                if ("POST".equals(method) && "/nav/poi".equals(path)) {
+                    com.orb.slam2s.navigation.NavigationService.Poi poi = navigationService.addPoi(
+                            req.optString("id", null),
+                            req.optString("name", null),
+                            req.getString("nodeId"),
+                            req.optString("category", "default"));
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("id", poi.id);
+                    out.put("nodeId", poi.nodeId);
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                if ("POST".equals(method) && "/nav/save".equals(path)) {
+                    String mapName = req.getString("mapName");
+                    java.io.File f = navigationService.saveToMap(mapName);
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("file", f.getAbsolutePath());
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                if ("POST".equals(method) && "/nav/load".equals(path)) {
+                    String mapName = req.getString("mapName");
+                    java.io.File f = navigationService.loadFromMap(mapName);
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("file", f.getAbsolutePath());
+                    out.put("graph", navigationService.toJson());
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                if ("GET".equals(method) && "/nav/route".equals(path)) {
+                    String poiId = getQueryParam(query, "poiId");
+                    if (poiId == null || poiId.trim().isEmpty()) {
+                        throw new IllegalArgumentException("missing poiId query param");
+                    }
+                    JSONObject out = new JSONObject();
+                    out.put("ok", true);
+                    out.put("route", navigationService.computeRouteToPoi(poiId));
+                    sendJson(os, out.toString());
+                    return;
+                }
+
+                send404(os);
+            } catch (Exception e) {
+                Log.e(TAG, "导航请求处理失败", e);
+                sendJsonError(os, 400, e.getMessage());
+            }
+        }
+
+        private String readRequestBodyAsString(InputStream is) throws IOException {
+            ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
+            int contentLength = -1;
+            boolean isChunked = false;
+
+            byte[] last4 = new byte[4];
+            int b;
+            int count = 0;
+
+            while ((b = is.read()) != -1) {
+                headerBuffer.write(b);
+                if (count < 4) {
+                    last4[count++] = (byte) b;
+                } else {
+                    last4[0] = last4[1];
+                    last4[1] = last4[2];
+                    last4[2] = last4[3];
+                    last4[3] = (byte) b;
+                }
+                if (count >= 4 && last4[0] == 13 && last4[1] == 10 && last4[2] == 13 && last4[3] == 10) {
+                    break;
+                }
+            }
+
+            String headers = headerBuffer.toString("UTF-8");
+            for (String line : headers.split("\r\n")) {
+                if (line.toLowerCase().startsWith("content-length:")) {
+                    contentLength = Integer.parseInt(line.substring("content-length:".length()).trim());
+                }
+                if (line.toLowerCase().startsWith("transfer-encoding:") && line.toLowerCase().contains("chunked")) {
+                    isChunked = true;
+                }
+            }
+
+            byte[] data;
+            if (contentLength > 0) {
+                data = new byte[contentLength];
+                int totalRead = 0;
+                while (totalRead < contentLength) {
+                    int read = is.read(data, totalRead, contentLength - totalRead);
+                    if (read == -1) break;
+                    totalRead += read;
+                }
+                if (totalRead < contentLength) {
+                    byte[] shorter = new byte[totalRead];
+                    System.arraycopy(data, 0, shorter, 0, totalRead);
+                    data = shorter;
+                }
+            } else if (isChunked) {
+                ByteArrayOutputStream chunked = new ByteArrayOutputStream();
+                while (true) {
+                    String chunkSizeLine = readLine(is);
+                    if (chunkSizeLine == null) break;
+                    String sizePart = chunkSizeLine.split(";", 2)[0].trim();
+                    if (sizePart.isEmpty()) continue;
+                    int chunkSize = Integer.parseInt(sizePart, 16);
+                    if (chunkSize == 0) {
+                        readLine(is);
+                        break;
+                    }
+                    byte[] chunk = new byte[chunkSize];
+                    int got = 0;
+                    while (got < chunkSize) {
+                        int read = is.read(chunk, got, chunkSize - got);
+                        if (read == -1) break;
+                        got += read;
+                    }
+                    chunked.write(chunk, 0, got);
+                    readLine(is);
+                }
+                data = chunked.toByteArray();
+            } else {
+                data = new byte[0];
+            }
+
+            return new String(data, java.nio.charset.StandardCharsets.UTF_8).trim();
+        }
+
+        private String getQueryParam(String query, String key) {
+            if (query == null || query.isEmpty()) return null;
+            for (String part : query.split("&")) {
+                String[] kv = part.split("=", 2);
+                if (kv.length == 2 && kv[0].equals(key)) {
+                    try {
+                        return java.net.URLDecoder.decode(kv[1], "UTF-8");
+                    } catch (Exception e) {
+                        return kv[1];
+                    }
+                }
+            }
+            return null;
+        }
+
+        private void sendJson(OutputStream os, String json) throws IOException {
+            byte[] bytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            String header = "HTTP/1.1 200 OK\r\n" +
+                    "Content-Type: application/json; charset=UTF-8\r\n" +
+                    "Content-Length: " + bytes.length + "\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n\r\n";
+            os.write(header.getBytes());
+            os.write(bytes);
+            os.flush();
+        }
+
+        private void sendJsonError(OutputStream os, int statusCode, String msg) throws IOException {
+            String safe = msg == null ? "unknown error" : msg.replace('"', '\'');
+            byte[] bytes = ("{\"ok\":false,\"error\":\"" + safe + "\"}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            String header = "HTTP/1.1 " + statusCode + " Bad Request\r\n" +
+                    "Content-Type: application/json; charset=UTF-8\r\n" +
+                    "Content-Length: " + bytes.length + "\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n\r\n";
+            os.write(header.getBytes());
+            os.write(bytes);
+            os.flush();
+        }
         private void handleUploadFrame(InputStream is, OutputStream os) throws IOException {
             try {
                 // 手动读取HTTP头部（不使用BufferedReader避免消耗body数据）
                 ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream();
                 int contentLength = -1;
+                boolean isChunked = false;
 
                 // 使用4字节缓冲区检测 \r\n\r\n
                 byte[] last4 = new byte[4];
@@ -479,28 +709,71 @@ public class WebServer {
                 for (String line : headers.split("\r\n")) {
                     if (line.toLowerCase().startsWith("content-length:")) {
                         contentLength = Integer.parseInt(line.substring("content-length:".length()).trim());
-                        break;
+                    }
+                    if (line.toLowerCase().startsWith("transfer-encoding:") &&
+                            line.toLowerCase().contains("chunked")) {
+                        isChunked = true;
                     }
                 }
 
-                if (contentLength <= 0) {
-                    Log.e(TAG, "handleUploadFrame: Content-Length无效或未找到");
+                byte[] imageData;
+                int totalRead;
+
+                if (contentLength > 0) {
+                    // 读取图像数据（POST body）
+                    imageData = new byte[contentLength];
+                    totalRead = 0;
+                    while (totalRead < contentLength) {
+                        int read = is.read(imageData, totalRead, contentLength - totalRead);
+                        if (read == -1)
+                            break;
+                        totalRead += read;
+                    }
+                } else if (isChunked) {
+                    ByteArrayOutputStream chunkedBuffer = new ByteArrayOutputStream();
+                    while (true) {
+                        String chunkSizeLine = readLine(is);
+                        if (chunkSizeLine == null)
+                            break;
+
+                        // 兼容 chunk-size;ext 语法
+                        String sizePart = chunkSizeLine.split(";", 2)[0].trim();
+                        if (sizePart.isEmpty()) {
+                            continue;
+                        }
+
+                        int chunkSize = Integer.parseInt(sizePart, 16);
+                        if (chunkSize == 0) {
+                            // 读取最后的 CRLF
+                            readLine(is);
+                            break;
+                        }
+
+                        byte[] chunkData = new byte[chunkSize];
+                        int chunkRead = 0;
+                        while (chunkRead < chunkSize) {
+                            int read = is.read(chunkData, chunkRead, chunkSize - chunkRead);
+                            if (read == -1)
+                                break;
+                            chunkRead += read;
+                        }
+                        chunkedBuffer.write(chunkData, 0, chunkRead);
+
+                        // 每个chunk后面会有一个CRLF
+                        readLine(is);
+                    }
+
+                    imageData = chunkedBuffer.toByteArray();
+                    totalRead = imageData.length;
+                } else {
+                    Log.e(TAG, "handleUploadFrame: Content-Length无效且非chunked请求");
                     send404(os);
                     return;
                 }
 
-                // 读取图像数据（POST body）
-                byte[] imageData = new byte[contentLength];
-                int totalRead = 0;
-                while (totalRead < contentLength) {
-                    int read = is.read(imageData, totalRead, contentLength - totalRead);
-                    if (read == -1)
-                        break;
-                    totalRead += read;
-                }
-
                 // 触发回调
-                if (frameReceivedListener != null && totalRead == contentLength) {
+                if (frameReceivedListener != null && totalRead > 0
+                        && (contentLength <= 0 || totalRead == contentLength)) {
                     frameReceivedListener.onFrameReceived(imageData);
                 } else {
                     if (frameReceivedListener == null) {

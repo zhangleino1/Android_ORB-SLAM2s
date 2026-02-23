@@ -250,6 +250,22 @@
                     </div>
                 </div>
 
+                <div class="control-group">
+                    <div class="control-group-title">导航标注</div>
+                    <div class="btn-row">
+                        <button onclick="addNavNode()">添加导航点</button>
+                        <button onclick="addPoi()">添加POI</button>
+                    </div>
+                    <div class="btn-row">
+                        <button onclick="linkLastTwoNodes()">连接最近两点</button>
+                        <button onclick="saveNav()">保存标注</button>
+                    </div>
+                    <div class="btn-row">
+                        <button onclick="loadNav()">加载标注</button>
+                        <button onclick="planRouteToPoi()" class="primary">导航到POI</button>
+                    </div>
+                </div>
+
                 <div class="control-group" style="margin-top: 5px;">
                     <div class="slider-container">
                         <span>粒子:</span>
@@ -277,6 +293,8 @@
 
         let scene, camera, renderer, controls;
         let trackedPointsCloud, mapPointsCloud, arObjects = [];
+        let navRouteLine = null;
+        let lastNavNodeIds = [];
         let trackedGeometry, mapGeometry;
         let slamCameraProxy, slamCameraHelper; // SLAM相机代理和辅助显示
 
@@ -285,6 +303,11 @@
         let stream = null;
         let isCameraRunning = false;
         let frameInterval;
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('未处理的Promise异常', event.reason);
+            updateStatus('操作失败: ' + (event.reason?.message || event.reason || 'unknown'));
+        });
+
 
         function init() {
             if (typeof THREE === 'undefined') {
@@ -328,8 +351,8 @@
 
             window.addEventListener('resize', onWindowResize, false);
 
-            // 初始化相机捕获
-            initCamera();
+            // 相机由用户手动触发，兼容 iOS/部分Android 对 getUserMedia 的手势要求
+            updateStatus('点击“启动相机”后开始向安卓端推流');
 
             animate();
             setInterval(fetchData, 200);
@@ -355,6 +378,13 @@
             const statusText = document.getElementById('camera-status-text');
 
             try {
+                if (!window.isSecureContext) {
+                    throw new Error('当前不是安全上下文。请使用 https:// 访问，并先在浏览器中信任证书。');
+                }
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    throw new Error('当前浏览器不支持 getUserMedia');
+                }
+
                 // 请求后置相机（移动设备）
                 stream = await navigator.mediaDevices.getUserMedia({
                     video: {
@@ -365,9 +395,17 @@
                 });
 
                 video.srcObject = stream;
+                video.muted = true;
                 isCameraRunning = true;
                 if (statusText) statusText.innerText = "ON";
                 if (statusText) statusText.style.color = "#00bcd4";
+
+                // 某些浏览器在 srcObject 设置后仍需要显式 play()
+                try {
+                    await video.play();
+                } catch (playErr) {
+                    console.warn('video.play() 调用失败（可忽略，等待元数据回调）:', playErr);
+                }
 
                 // 等待视频加载完成
                 video.onloadedmetadata = () => {
@@ -578,6 +616,106 @@
             }
         }
 
+
+        async function addNavNode() {
+            const name = prompt('导航点名称(可选):', '');
+            const id = prompt('导航点ID(可选):', '');
+            const res = await fetch('/nav/node', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: id || undefined, name: name || undefined, type: 'waypoint' })
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'add node failed');
+            lastNavNodeIds.push(data.id);
+            updateStatus(`已添加导航点 ${data.id} (${data.x.toFixed(2)}, ${data.y.toFixed(2)}, ${data.z.toFixed(2)})`);
+        }
+
+        async function addPoi() {
+            const nodeId = prompt('绑定节点ID:');
+            if (!nodeId) return;
+            const poiId = prompt('POI ID:', 'poi_' + Date.now());
+            const name = prompt('POI 名称:', poiId || 'poi');
+            const res = await fetch('/nav/poi', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: poiId, name: name, nodeId: nodeId, category: 'default' })
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'add poi failed');
+            updateStatus(`已添加POI ${data.id} -> ${data.nodeId}`);
+        }
+
+        async function linkLastTwoNodes() {
+            if (lastNavNodeIds.length < 2) {
+                updateStatus('至少先添加两个导航点');
+                return;
+            }
+            const from = lastNavNodeIds[lastNavNodeIds.length - 2];
+            const to = lastNavNodeIds[lastNavNodeIds.length - 1];
+            const res = await fetch('/nav/edge', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from, to, bidirectional: true })
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'add edge failed');
+            updateStatus(`已连接 ${from} -> ${to}，距离${data.cost.toFixed(2)}m`);
+        }
+
+        async function saveNav() {
+            const mapName = prompt('保存到地图名(不含扩展名):', 'default_map');
+            if (!mapName) return;
+            const res = await fetch('/nav/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mapName })
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'save nav failed');
+            updateStatus(`导航标注已保存: ${data.file}`);
+        }
+
+        async function loadNav() {
+            const mapName = prompt('加载地图名(不含扩展名):', 'default_map');
+            if (!mapName) return;
+            const res = await fetch('/nav/load', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mapName })
+            });
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'load nav failed');
+            const graph = data.graph || {};
+            lastNavNodeIds = (graph.nodes || []).map(n => n.id);
+            updateStatus(`导航标注已加载，节点数: ${(graph.nodes || []).length}`);
+        }
+
+        async function planRouteToPoi() {
+            const poiId = prompt('输入目标POI ID:');
+            if (!poiId) return;
+            const res = await fetch(`/nav/route?poiId=${encodeURIComponent(poiId)}`);
+            const data = await res.json();
+            if (!data.ok) throw new Error(data.error || 'route failed');
+            renderRoute(data.route.pathNodes || []);
+            updateStatus(`导航路径已生成，长度: ${(data.route.distanceMeters || 0).toFixed(2)}m`);
+        }
+
+        function renderRoute(pathNodes) {
+            if (navRouteLine) {
+                scene.remove(navRouteLine);
+                if (navRouteLine.geometry) navRouteLine.geometry.dispose();
+                if (navRouteLine.material) navRouteLine.material.dispose();
+                navRouteLine = null;
+            }
+            if (!pathNodes || pathNodes.length < 2) return;
+
+            const pts = pathNodes.map(p => new THREE.Vector3(p.x, p.y, p.z));
+            const geo = new THREE.BufferGeometry().setFromPoints(pts);
+            const mat = new THREE.LineBasicMaterial({ color: 0xffd54f });
+            navRouteLine = new THREE.Line(geo, mat);
+            scene.add(navRouteLine);
+        }
         function fetchData() {
             fetch('/data').then(r => r.arrayBuffer()).then(buf => {
                 console.log('收到点云数据，大小:', buf.byteLength, '字节');
